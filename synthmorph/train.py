@@ -477,15 +477,13 @@ def save_curves(
     val_dices: list[float],
     val_epochs: list[int],
     output_dir: str,
+    epoch: int,
 ) -> None:
     ensure_dir(output_dir)
     loss_path = os.path.join(output_dir, config.loss_plot_filename)
     dice_path = os.path.join(output_dir, config.dice_plot_filename)
-
-    if os.path.exists(loss_path):
-        os.remove(loss_path)
-    if os.path.exists(dice_path):
-        os.remove(dice_path)
+    snapshots_dir = os.path.join(output_dir, "curve_snapshots")
+    ensure_dir(snapshots_dir)
 
     plt.figure(figsize=(8, 5))
     plt.plot(range(1, len(train_losses) + 1), train_losses, label="Train Loss")
@@ -498,6 +496,10 @@ def save_curves(
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(loss_path, dpi=150)
+    plt.savefig(
+        os.path.join(snapshots_dir, f"loss_curve_epoch_{epoch:04d}.png"),
+        dpi=150,
+    )
     plt.close()
 
     plt.figure(figsize=(8, 5))
@@ -507,10 +509,15 @@ def save_curves(
     plt.ylabel("Dice")
     plt.title("Validation Dice")
     plt.ylim(0.0, 1.0)
-    plt.legend()
+    if val_epochs:
+        plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(dice_path, dpi=150)
+    plt.savefig(
+        os.path.join(snapshots_dir, f"dice_curve_epoch_{epoch:04d}.png"),
+        dpi=150,
+    )
     plt.close()
 
 
@@ -786,6 +793,7 @@ def main() -> None:
             val_dices,
             val_epochs,
             run_output_dir,
+            epoch,
         )
 
         monitor_name = ""
