@@ -22,18 +22,31 @@ class SoftDiceLoss(nn.Module):
     ) -> torch.Tensor:
         if fixed_label_map.dim() == 3:
             fixed_label_map = fixed_label_map.unsqueeze(0)
-        if warped_moving_label_map.dim() == 3:
-            warped_moving_label_map = warped_moving_label_map.unsqueeze(0)
+
+        fixed_label_map = torch.clamp(fixed_label_map.long(), 0, self.num_classes - 1)
 
         fixed_probs = F.one_hot(
-            fixed_label_map.long(),
+            fixed_label_map,
             num_classes=self.num_classes,
         ).permute(0, 4, 1, 2, 3).float()
 
-        moving_probs = F.one_hot(
-            warped_moving_label_map.long(),
-            num_classes=self.num_classes,
-        ).permute(0, 4, 1, 2, 3).float()
+        if (
+            warped_moving_label_map.dim() == 5
+            and warped_moving_label_map.shape[1] == self.num_classes
+        ):
+            moving_probs = warped_moving_label_map.float()
+        else:
+            if warped_moving_label_map.dim() == 3:
+                warped_moving_label_map = warped_moving_label_map.unsqueeze(0)
+            warped_moving_label_map = torch.clamp(
+                warped_moving_label_map.long(),
+                0,
+                self.num_classes - 1,
+            )
+            moving_probs = F.one_hot(
+                warped_moving_label_map,
+                num_classes=self.num_classes,
+            ).permute(0, 4, 1, 2, 3).float()
 
         valid_classes = [
             class_index

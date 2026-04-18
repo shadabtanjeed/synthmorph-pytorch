@@ -432,26 +432,18 @@ class GenerateIntensityPair(GenerateLabelMapPair):
         # then for each voxel in that class, fill the voxel value with a random value from the normal distribution with the chosen mean and std
         # it should be run sepately for the fixed and moving label maps, so that the intensity values in the fixed and moving images are different even if the label maps are the same
         label_map = label_map.to(device=self.device, dtype=torch.long)
-        image = torch.zeros(*label_map.shape, device=self.device, dtype=self.dtype)
-
-        for class_index in range(self.J):
-            mask = label_map == class_index
-            if not torch.any(mask):
-                continue
-
-            class_mean = self._sample_uniform(self.intensity_mean_range)
-            class_std = self._sample_uniform(self.intensity_std_range)
-            class_values = (
-                torch.randn(
-                    int(mask.sum().item()),
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                * class_std
-                + class_mean
-            )
-            image[mask] = class_values
-
+        
+        means = torch.empty(self.J, device=self.device, dtype=self.dtype).uniform_(
+            self.intensity_mean_range[0], self.intensity_mean_range[1]
+        )
+        stds = torch.empty(self.J, device=self.device, dtype=self.dtype).uniform_(
+            self.intensity_std_range[0], self.intensity_std_range[1]
+        )
+        
+        pixel_means = means[label_map]
+        pixel_stds = stds[label_map]
+        
+        image = pixel_means + pixel_stds * torch.randn_like(pixel_means)
         return image
 
     def gaussianBlur(self, image: torch.Tensor) -> torch.Tensor:

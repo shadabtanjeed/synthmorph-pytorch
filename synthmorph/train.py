@@ -89,22 +89,27 @@ def field_to_sampling_grid(vector_field: torch.Tensor) -> torch.Tensor:
     return base_grid + normalized_field.permute(0, 2, 3, 4, 1)
 
 
-def warp_label_map(
-    label_map: torch.Tensor, integrated_field: torch.Tensor
+def warp_label_map_soft(
+    label_map: torch.Tensor,
+    integrated_field: torch.Tensor,
+    num_classes: int,
 ) -> torch.Tensor:
-    if label_map.dim() == 4:
-        label_map = label_map.unsqueeze(1)
+    if label_map.dim() == 3:
+        label_map = label_map.unsqueeze(0)
 
-    label_map = label_map.float()
+    label_map = torch.clamp(label_map.long(), 0, num_classes - 1)
+    one_hot = F.one_hot(label_map, num_classes=num_classes)
+    one_hot = one_hot.permute(0, 4, 1, 2, 3).to(dtype=integrated_field.dtype)
+
     sampling_grid = field_to_sampling_grid(integrated_field)
-    warped = F.grid_sample(
-        label_map,
+    warped_probs = F.grid_sample(
+        one_hot,
         sampling_grid,
-        mode="nearest",
+        mode="bilinear",
         padding_mode="border",
         align_corners=True,
     )
-    return warped.squeeze(1).round().long()
+    return warped_probs
 
 
 def get_optimizer(
@@ -281,13 +286,22 @@ def evaluate_on_validation(
             model_input = torch.stack([fixed_image, moving_image], dim=0).unsqueeze(0)
             vector_field = model(model_input)
             integrated_field = integration_layer(vector_field)
-            warped_moving_label = warp_label_map(
-                moving_label.unsqueeze(0), integrated_field
+            warped_moving_probs = warp_label_map_soft(
+                moving_label.unsqueeze(0),
+                integrated_field,
+                num_classes=config.val_num_classes,
+            )
+
+            # Clamp labels to valid range for loss computation
+            fixed_label_clamped = torch.clamp(
+                fixed_label.unsqueeze(0),
+                0,
+                config.val_num_classes - 1,
             )
 
             val_total_loss, val_similarity_loss, _ = val_loss_fn(
-                fixed_label.unsqueeze(0),
-                warped_moving_label,
+                fixed_label_clamped,
+                warped_moving_probs,
                 vector_field,
             )
             val_dice = 1.0 - val_similarity_loss
@@ -414,6 +428,8 @@ def main() -> None:
     val_epochs: list[int] = []
 
     best_val_loss = float("inf")
+    best_train_loss = float("inf")
+    epochs_without_improvement = 0
     best_model_path = os.path.join(config.output_dir, config.best_model_filename)
 
     epoch_progress = tqdm(range(1, config.num_epochs + 1), desc="Epochs")
@@ -434,6 +450,8 @@ def main() -> None:
             fixed_label = batch["fixed_label_map"].to(device, non_blocking=True)
             moving_label = batch["moving_label_map"].to(device, non_blocking=True)
 
+            optimizer.zero_grad(set_to_none=True)
+
             autocast_ctx = (
                 torch.autocast(device_type="cuda", dtype=amp_dtype)
                 if use_amp
@@ -443,13 +461,18 @@ def main() -> None:
                 model_input = torch.cat([fixed_image, moving_image], dim=1)
                 vector_field = model(model_input)
                 integrated_field = integration_layer(vector_field)
-                warped_moving_label = warp_label_map(moving_label, integrated_field)
-
-                total_loss, _, _ = train_loss_fn(
-                    fixed_label, warped_moving_label, vector_field
+                warped_moving_probs = warp_label_map_soft(
+                    moving_label,
+                    integrated_field,
+                    num_classes=config.train_num_classes,
                 )
 
-            optimizer.zero_grad(set_to_none=True)
+                total_loss, _, _ = train_loss_fn(
+                    fixed_label,
+                    warped_moving_probs,
+                    vector_field,
+                )
+
             total_loss.backward()
             optimizer.step()
 
@@ -460,6 +483,21 @@ def main() -> None:
         train_losses.append(epoch_train_loss)
 
         log_suffix = f"train_loss={epoch_train_loss:.4f}"
+
+        # Early stopping based on training loss
+        if epoch_train_loss < best_train_loss:
+            best_train_loss = epoch_train_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= config.early_stopping_patience:
+            print(
+                f"\nEarly stopping triggered: No improvement in training loss for "
+                f"{config.early_stopping_patience} epochs."
+            )
+            epoch_progress.close()
+            break
 
         if epoch % config.validate_every == 0:
             val_loss, val_dice = evaluate_on_validation(
