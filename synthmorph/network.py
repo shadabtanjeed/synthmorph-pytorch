@@ -100,7 +100,7 @@ class SynthMorphUNet(nn.Module):
             padding=1,
         )
 
-        nn.init.normal_(self.vector_field_head.weight, mean=0.0, std=1e-5)
+        nn.init.normal_(self.vector_field_head.weight, mean=0.0, std=1e-3)
         if self.vector_field_head.bias is not None:
             nn.init.zeros_(self.vector_field_head.bias)
 

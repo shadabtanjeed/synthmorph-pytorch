@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import random
+from datetime import datetime
 from pathlib import Path
 from contextlib import nullcontext
 
@@ -110,6 +111,85 @@ def warp_label_map_soft(
         align_corners=True,
     )
     return warped_probs
+
+
+def warp_intensity_map(
+    image: torch.Tensor,
+    integrated_field: torch.Tensor,
+) -> torch.Tensor:
+    if image.dim() == 3:
+        image = image.unsqueeze(0).unsqueeze(0)
+    elif image.dim() == 4:
+        image = image.unsqueeze(1)
+
+    image = image.float()
+    sampling_grid = field_to_sampling_grid(integrated_field)
+    warped = F.grid_sample(
+        image,
+        sampling_grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    )
+    return warped.squeeze(1)
+
+
+def resolve_run_output_dir(base_output_dir: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_parent = os.path.dirname(base_output_dir.rstrip(os.sep)) or "outputs"
+    return os.path.join(base_parent, timestamp)
+
+
+def _normalize_slice_for_plot(slice_2d: torch.Tensor) -> torch.Tensor:
+    min_val = slice_2d.min()
+    max_val = slice_2d.max()
+    denom = torch.clamp(max_val - min_val, min=1e-6)
+    return (slice_2d - min_val) / denom
+
+
+def save_validation_samples(
+    samples: list[dict],
+    epoch: int,
+    output_dir: str,
+) -> None:
+    if not samples:
+        return
+
+    vis_dir = os.path.join(output_dir, "val_samples")
+    ensure_dir(vis_dir)
+    save_path = os.path.join(vis_dir, f"epoch_{epoch:04d}.png")
+
+    rows = len(samples)
+    fig, axes = plt.subplots(rows, 3, figsize=(12, 3.5 * rows))
+    if rows == 1:
+        axes = [axes]
+
+    for row_index, sample in enumerate(samples):
+        fixed_slice = sample["fixed_slice"]
+        moving_slice = sample["moving_slice"]
+        warped_slice = sample["warped_slice"]
+
+        axes[row_index][0].imshow(fixed_slice, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[row_index][1].imshow(moving_slice, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[row_index][2].imshow(warped_slice, cmap="gray", vmin=0.0, vmax=1.0)
+
+        axes[row_index][0].set_title(
+            f"Fixed\n{sample['fixed_name']}",
+            fontsize=9,
+        )
+        axes[row_index][1].set_title(
+            f"Moving\n{sample['moving_name']}",
+            fontsize=9,
+        )
+        axes[row_index][2].set_title("Registered Moving", fontsize=9)
+
+        for axis in axes[row_index]:
+            axis.axis("off")
+
+    fig.suptitle(f"Validation Registration Samples - Epoch {epoch}", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 
 def get_optimizer(
@@ -244,6 +324,8 @@ def evaluate_on_validation(
     integration_layer,
     val_loss_fn: SynthMorphLoss,
     device: torch.device,
+    epoch: int,
+    output_dir: str,
 ) -> tuple[float, float]:
     patients = discover_validation_patients()
     pairs = build_validation_pairs(patients)
@@ -254,10 +336,14 @@ def evaluate_on_validation(
     model.eval()
     total_val_loss = 0.0
     total_val_dice = 0.0
+    flow_scale = float(getattr(config, "flow_scale", 1.0))
+    num_vis_pairs = min(5, len(pairs))
+    vis_pair_indices = set(random.sample(range(len(pairs)), num_vis_pairs))
+    vis_samples: list[dict] = []
 
     with torch.no_grad():
         progress = tqdm(pairs, desc="Validation", leave=False)
-        for fixed_patient, moving_patient in progress:
+        for pair_index, (fixed_patient, moving_patient) in enumerate(progress):
             fixed_image = load_nifti_tensor(
                 fixed_patient / config.val_image_filename,
                 is_label=False,
@@ -285,7 +371,8 @@ def evaluate_on_validation(
 
             model_input = torch.stack([fixed_image, moving_image], dim=0).unsqueeze(0)
             vector_field = model(model_input)
-            integrated_field = integration_layer(vector_field)
+            effective_vector_field = vector_field * flow_scale
+            integrated_field = integration_layer(effective_vector_field)
             warped_moving_probs = warp_label_map_soft(
                 moving_label.unsqueeze(0),
                 integrated_field,
@@ -302,9 +389,36 @@ def evaluate_on_validation(
             val_total_loss, val_similarity_loss, _ = val_loss_fn(
                 fixed_label_clamped,
                 warped_moving_probs,
-                vector_field,
+                effective_vector_field,
             )
             val_dice = 1.0 - val_similarity_loss
+
+            if pair_index in vis_pair_indices:
+                warped_moving_image = warp_intensity_map(
+                    moving_image.unsqueeze(0),
+                    integrated_field,
+                ).squeeze(0)
+
+                center_index = fixed_image.shape[0] // 2
+                fixed_slice = _normalize_slice_for_plot(
+                    fixed_image[center_index].detach().cpu()
+                ).numpy()
+                moving_slice = _normalize_slice_for_plot(
+                    moving_image[center_index].detach().cpu()
+                ).numpy()
+                warped_slice = _normalize_slice_for_plot(
+                    warped_moving_image[center_index].detach().cpu()
+                ).numpy()
+
+                vis_samples.append(
+                    {
+                        "fixed_slice": fixed_slice,
+                        "moving_slice": moving_slice,
+                        "warped_slice": warped_slice,
+                        "fixed_name": fixed_patient.name,
+                        "moving_name": moving_patient.name,
+                    }
+                )
 
             total_val_loss += float(val_total_loss.item())
             total_val_dice += float(val_dice.item())
@@ -316,6 +430,7 @@ def evaluate_on_validation(
 
     mean_val_loss = total_val_loss / len(pairs)
     mean_val_dice = total_val_dice / len(pairs)
+    save_validation_samples(vis_samples, epoch=epoch, output_dir=output_dir)
     return mean_val_loss, mean_val_dice
 
 
@@ -347,7 +462,7 @@ def log_epoch(
         f.write(f"{epoch},")
         f.write(f"{train_total_loss:.6f},")
         f.write(f"{train_similarity_loss:.6f},")
-        f.write(f"{train_smooth_loss:.6f},")
+        f.write(f"{train_smooth_loss:.8e},")
         
         if val_loss is not None and val_dice is not None:
             f.write(f"{val_loss:.6f},")
@@ -361,10 +476,11 @@ def save_curves(
     val_losses: list[float],
     val_dices: list[float],
     val_epochs: list[int],
+    output_dir: str,
 ) -> None:
-    ensure_dir(config.output_dir)
-    loss_path = os.path.join(config.output_dir, config.loss_plot_filename)
-    dice_path = os.path.join(config.output_dir, config.dice_plot_filename)
+    ensure_dir(output_dir)
+    loss_path = os.path.join(output_dir, config.loss_plot_filename)
+    dice_path = os.path.join(output_dir, config.dice_plot_filename)
 
     if os.path.exists(loss_path):
         os.remove(loss_path)
@@ -409,9 +525,18 @@ def main() -> None:
     amp_dtype_name = str(getattr(config, "amp_dtype", "bfloat16")).lower()
     amp_dtype = torch.bfloat16 if amp_dtype_name == "bfloat16" else torch.float16
     use_amp = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
+    debug_training = bool(getattr(config, "debug_training", False))
+    debug_every_n_epochs = max(1, int(getattr(config, "debug_every_n_epochs", 1)))
+    debug_batches_per_epoch = max(1, int(getattr(config, "debug_batches_per_epoch", 1)))
 
-    ensure_dir(config.output_dir)
-    log_path = setup_logger(config.output_dir)
+    early_stopping_patience = int(getattr(config, "early_stopping_patience", 0))
+    early_stopping_metric = str(getattr(config, "early_stopping_metric", "val")).lower()
+    early_stopping_min_delta = float(getattr(config, "early_stopping_min_delta", 0.0))
+    flow_scale = float(getattr(config, "flow_scale", 1.0))
+
+    run_output_dir = resolve_run_output_dir(config.output_dir)
+    ensure_dir(run_output_dir)
+    log_path = setup_logger(run_output_dir)
 
     validated_patients = validate_validation_folder_structure()
     if validated_patients:
@@ -466,9 +591,9 @@ def main() -> None:
     val_epochs: list[int] = []
 
     best_val_loss = float("inf")
-    best_train_loss = float("inf")
+    best_early_stop_metric = float("inf")
     epochs_without_improvement = 0
-    best_model_path = os.path.join(config.output_dir, config.best_model_filename)
+    best_model_path = os.path.join(run_output_dir, config.best_model_filename)
 
     epoch_progress = tqdm(range(1, config.num_epochs + 1), desc="Epochs")
     for epoch in epoch_progress:
@@ -480,7 +605,7 @@ def main() -> None:
         batch_progress = tqdm(
             train_loader, desc=f"Train {epoch}/{config.num_epochs}", leave=False
         )
-        for batch in batch_progress:
+        for batch_index, batch in enumerate(batch_progress, start=1):
             fixed_image = (
                 batch["fixed_image"].to(device, non_blocking=True).unsqueeze(1)
             )
@@ -500,7 +625,8 @@ def main() -> None:
             with autocast_ctx:
                 model_input = torch.cat([fixed_image, moving_image], dim=1)
                 vector_field = model(model_input)
-                integrated_field = integration_layer(vector_field)
+                effective_vector_field = vector_field * flow_scale
+                integrated_field = integration_layer(effective_vector_field)
                 warped_moving_probs = warp_label_map_soft(
                     moving_label,
                     integrated_field,
@@ -510,10 +636,73 @@ def main() -> None:
                 total_loss, similarity_loss, smooth_loss = train_loss_fn(
                     fixed_label,
                     warped_moving_probs,
-                    vector_field,
+                    effective_vector_field,
                 )
 
             total_loss.backward()
+
+            should_debug_batch = (
+                debug_training
+                and epoch % debug_every_n_epochs == 0
+                and batch_index <= debug_batches_per_epoch
+            )
+            if should_debug_batch:
+                with torch.no_grad():
+                    identity_field = torch.zeros_like(integrated_field)
+                    identity_probs = warp_label_map_soft(
+                        moving_label,
+                        identity_field,
+                        num_classes=config.train_num_classes,
+                    )
+                    identity_similarity = train_loss_fn.dice_loss(
+                        fixed_label,
+                        identity_probs,
+                    )
+                    identity_dice = float((1.0 - identity_similarity).item())
+                    warped_dice = float((1.0 - similarity_loss.detach()).item())
+                    field_abs_mean = float(vector_field.detach().abs().mean().item())
+                    field_abs_max = float(vector_field.detach().abs().max().item())
+                    effective_field_abs_mean = float(
+                        effective_vector_field.detach().abs().mean().item()
+                    )
+                    effective_field_abs_max = float(
+                        effective_vector_field.detach().abs().max().item()
+                    )
+                    integrated_abs_mean = float(
+                        integrated_field.detach().abs().mean().item()
+                    )
+                    integrated_abs_max = float(
+                        integrated_field.detach().abs().max().item()
+                    )
+
+                head_grad = model.vector_field_head.weight.grad
+                grad_abs_mean = (
+                    float(head_grad.detach().abs().mean().item())
+                    if head_grad is not None
+                    else float("nan")
+                )
+                grad_abs_max = (
+                    float(head_grad.detach().abs().max().item())
+                    if head_grad is not None
+                    else float("nan")
+                )
+
+                print(
+                    "[Debug] "
+                    f"epoch={epoch} batch={batch_index} "
+                    f"identity_dice={identity_dice:.4f} "
+                    f"warped_dice={warped_dice:.4f} "
+                    f"flow_scale={flow_scale:.2f} "
+                    f"field_abs_mean={field_abs_mean:.6f} "
+                    f"field_abs_max={field_abs_max:.6f} "
+                    f"effective_field_abs_mean={effective_field_abs_mean:.6f} "
+                    f"effective_field_abs_max={effective_field_abs_max:.6f} "
+                    f"integrated_abs_mean={integrated_abs_mean:.6f} "
+                    f"integrated_abs_max={integrated_abs_max:.6f} "
+                    f"head_grad_abs_mean={grad_abs_mean:.6e} "
+                    f"head_grad_abs_max={grad_abs_max:.6e}"
+                )
+
             optimizer.step()
 
             running_train_loss += float(total_loss.item())
@@ -526,26 +715,25 @@ def main() -> None:
         epoch_smooth_loss = running_smooth_loss / len(train_loader)
         train_losses.append(epoch_train_loss)
 
+        print(
+            f"[Train] epoch={epoch} "
+            f"train_loss={epoch_train_loss:.6f} "
+            f"train_similarity={epoch_similarity_loss:.6f} "
+            f"train_smooth={epoch_smooth_loss:.8e}"
+        )
+
         log_suffix = f"train_loss={epoch_train_loss:.4f}"
-
-        # Early stopping based on training loss
-        if epoch_train_loss < best_train_loss:
-            best_train_loss = epoch_train_loss
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-
-        if epochs_without_improvement >= config.early_stopping_patience:
-            print(
-                f"\nEarly stopping triggered: No improvement in training loss for "
-                f"{config.early_stopping_patience} epochs."
-            )
-            epoch_progress.close()
-            break
+        val_loss = None
+        val_dice = None
 
         if epoch % config.validate_every == 0:
             val_loss, val_dice = evaluate_on_validation(
-                model, integration_layer, val_loss_fn, device
+                model,
+                integration_layer,
+                val_loss_fn,
+                device,
+                epoch,
+                run_output_dir,
             )
             val_losses.append(val_loss)
             val_dices.append(val_dice)
@@ -578,8 +766,10 @@ def main() -> None:
                     },
                     best_model_path,
                 )
-
-            save_curves(train_losses, val_losses, val_dices, val_epochs)
+                print(
+                    f"[Best] epoch={epoch} val_loss={best_val_loss:.6f} "
+                    f"saved={best_model_path}"
+                )
             log_suffix += f", val_loss={val_loss:.4f}, val_dice={val_dice:.4f}"
         else:
             log_epoch(
@@ -590,9 +780,48 @@ def main() -> None:
                 epoch_smooth_loss,
             )
 
+        save_curves(
+            train_losses,
+            val_losses,
+            val_dices,
+            val_epochs,
+            run_output_dir,
+        )
+
+        monitor_name = ""
+        monitor_value: float | None = None
+
+        if early_stopping_metric == "val":
+            if val_loss is not None and not math.isnan(val_loss):
+                monitor_name = "validation loss"
+                monitor_value = float(val_loss)
+        else:
+            monitor_name = "training loss"
+            monitor_value = float(epoch_train_loss)
+
+        if early_stopping_patience > 0 and monitor_value is not None:
+            improved = monitor_value < (
+                best_early_stop_metric - early_stopping_min_delta
+            )
+            if improved:
+                best_early_stop_metric = monitor_value
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= early_stopping_patience:
+                print(
+                    "\nEarly stopping triggered: "
+                    f"no improvement in {monitor_name} for "
+                    f"{early_stopping_patience} monitored checks."
+                )
+                epoch_progress.close()
+                break
+
         epoch_progress.set_postfix_str(log_suffix)
 
     print("Training complete.")
+    print(f"Run outputs: {run_output_dir}")
     if best_val_loss < float("inf"):
         print(f"Best validation loss: {best_val_loss:.6f}")
         print(f"Best model: {best_model_path}")

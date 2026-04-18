@@ -19,27 +19,37 @@ num_workers = 0
 pin_memory = False
 prefetch_factor = 2
 persistent_workers = num_workers > 0
-num_epochs = 150
+num_epochs = 250
 learning_rate = 1e-4
 optimizer_type = "AdamW"
 weight_decay = 1e-5
 regularization_weight = 1.0
 use_amp = device == "cuda"
 amp_dtype = "bfloat16"
-early_stopping_patience = 15
+early_stopping_patience = 5
+early_stopping_metric = "val"
+early_stopping_min_delta = 1e-3
+
+# Optional debug tracing
+debug_training = True
+debug_every_n_epochs = 5
+debug_batches_per_epoch = 8
 
 # Data and label settings
 image_size = (160, 192, 224)
-train_dataset_size = 100
+train_dataset_size = 500
 train_num_classes = 26
 val_num_classes = 35
 ignore_label = 0
 
 # Integration / deformation settings
 integration_steps = 7
+# Optional multiplier applied to the predicted velocity field before integration.
+# Use 1.0 for baseline behavior, or try 10.0 as a jumpstart if deformations stay tiny.
+flow_scale = 10.0
 
 # Validation schedule and data
-validate_every = 10
+validate_every = 5
 val_data_dir = "/kaggle/neurite-oasis-split/val"
 val_image_filename = "aligned_norm.nii.gz"
 val_label_filename = "aligned_seg35.nii.gz"
@@ -55,6 +65,6 @@ dice_plot_filename = "dice_curve.png"
 generator_config = {
     "full_image_size": image_size,
     "num_classes": train_num_classes,
-    "device": "cuda",  # Generate on CPU; H100 trains on GPU data transferred per batch
+    "device": device,
     "integration_steps": integration_steps,
 }

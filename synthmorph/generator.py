@@ -87,8 +87,12 @@ class GenerateLabelMap:
         self,
         field: torch.Tensor,
         target_size: tuple[int, int, int],
+        scale_magnitude: bool = False,
     ) -> torch.Tensor:
-        # Upsample a 3D displacement field and rescale its vector magnitudes.
+        # Upsample a 3D displacement field.
+        #
+        # For synthetic deformation sampling, preserving the sampled magnitude is
+        # typically preferable. Optional scaling is kept for completeness.
         resized = F.interpolate(
             field,
             size=target_size,
@@ -96,14 +100,16 @@ class GenerateLabelMap:
             align_corners=True,
         )
 
-        src_size = field.shape[2:]
-        scale_factors = [
-            (target - 1) / max(source - 1, 1)
-            for source, target in zip(src_size, target_size)
-        ]
-        resized[:, 0] *= scale_factors[2]
-        resized[:, 1] *= scale_factors[1]
-        resized[:, 2] *= scale_factors[0]
+        if scale_magnitude:
+            src_size = field.shape[2:]
+            scale_factors = [
+                (target - 1) / max(source - 1, 1)
+                for source, target in zip(src_size, target_size)
+            ]
+            resized[:, 0] *= scale_factors[2]
+            resized[:, 1] *= scale_factors[1]
+            resized[:, 2] *= scale_factors[0]
+
         return resized
 
     def _field_to_sampling_grid(self, deformation_field: torch.Tensor) -> torch.Tensor:
