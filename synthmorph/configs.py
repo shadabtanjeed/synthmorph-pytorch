@@ -14,7 +14,7 @@ seed = 42
 
 # Runtime and optimization
 device = "cuda" if torch.cuda.is_available() else "cpu"
-batch_size = 8
+batch_size = 4
 num_workers = 0
 pin_memory = False
 prefetch_factor = 2
@@ -26,14 +26,14 @@ weight_decay = 1e-5
 regularization_weight = 1.0
 use_amp = device == "cuda"
 amp_dtype = "bfloat16"
-early_stopping_patience = 5
+early_stopping_patience = 15
 early_stopping_metric = "val"
 early_stopping_min_delta = 1e-3
 
 # Optional debug tracing
 debug_training = True
 debug_every_n_epochs = 5
-debug_batches_per_epoch = 8
+debug_batches_per_epoch = 4
 
 # Data and label settings
 image_size = (160, 192, 224)

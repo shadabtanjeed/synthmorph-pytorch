@@ -28,7 +28,7 @@ class SynthMorphUNet(nn.Module):
     def __init__(self):
         super().__init__()
 
-        encoder_filters = (16, 32, 32, 32)
+        encoder_filters = (64, 64, 64, 64)
 
         self.enc1 = ConvBlock(2, encoder_filters[0])
         self.down1 = nn.Conv3d(

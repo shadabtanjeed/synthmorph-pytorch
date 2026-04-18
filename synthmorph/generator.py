@@ -229,7 +229,7 @@ class GenerateLabelMapPair(GenerateLabelMap):
     # and creates a pair of images (s_f, s_m) from the label map
     PAIR_DEFAULT_CONFIG = {
         "pair_deformation_std_min": 3.0,
-        "pair_deformation_std_max": 15.0,
+        "pair_deformation_std_max": 8.0,
     }
 
     def __init__(self, config: Mapping[str, Any] | None = None):
