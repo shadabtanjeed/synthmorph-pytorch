@@ -134,6 +134,63 @@ def discover_validation_patients() -> list[Path]:
     return patients
 
 
+def validate_validation_folder_structure() -> list[Path]:
+    if config.validate_every <= 0:
+        return []
+
+    if not config.val_data_dir:
+        raise ValueError(
+            "Validation is enabled, but config.val_data_dir is empty. "
+            "Set a valid validation folder path in synthmorph/configs.py."
+        )
+
+    val_root = Path(config.val_data_dir)
+    if not val_root.exists():
+        raise FileNotFoundError(
+            f"Validation folder not found: {val_root}. "
+            "Check config.val_data_dir in synthmorph/configs.py."
+        )
+
+    if not val_root.is_dir():
+        raise NotADirectoryError(f"Validation path is not a directory: {val_root}.")
+
+    patient_dirs = [entry for entry in val_root.iterdir() if entry.is_dir()]
+    if len(patient_dirs) < 2:
+        raise ValueError(
+            "Validation folder format is invalid. "
+            "Expected at least 2 patient subfolders under val_data_dir."
+        )
+
+    invalid_patients: list[str] = []
+    valid_patients: list[Path] = []
+
+    for patient_dir in sorted(patient_dirs):
+        image_path = patient_dir / config.val_image_filename
+        label_path = patient_dir / config.val_label_filename
+
+        missing = []
+        if not image_path.exists():
+            missing.append(config.val_image_filename)
+        if not label_path.exists():
+            missing.append(config.val_label_filename)
+
+        if missing:
+            invalid_patients.append(f"{patient_dir.name}: missing {', '.join(missing)}")
+            continue
+
+        valid_patients.append(patient_dir)
+
+    if invalid_patients:
+        details = "\n  - " + "\n  - ".join(invalid_patients)
+        raise ValueError(
+            "Validation folder format is invalid. Each patient subfolder must contain "
+            f"{config.val_image_filename} and {config.val_label_filename}."
+            f"\nInvalid patient folders:{details}"
+        )
+
+    return valid_patients
+
+
 def build_validation_pairs(patients: list[Path]) -> list[tuple[Path, Path]]:
     if len(patients) < 2:
         return []
@@ -274,6 +331,13 @@ def main() -> None:
 
     device = torch.device(config.device)
     ensure_dir(config.output_dir)
+
+    validated_patients = validate_validation_folder_structure()
+    if validated_patients:
+        print(
+            "Validation folder check passed: "
+            f"{len(validated_patients)} patient folders with required files."
+        )
 
     train_dataset = SynthMorphDataset(
         size=config.train_dataset_size,
