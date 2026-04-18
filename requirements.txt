@@ -1,5 +1,4 @@
 matplotlib
 nibabel
-synthmorph
 torch
 tqdm
