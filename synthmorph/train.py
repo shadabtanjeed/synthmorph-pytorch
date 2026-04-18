@@ -4,6 +4,7 @@ import math
 import os
 import random
 from pathlib import Path
+from contextlib import nullcontext
 
 import matplotlib.pyplot as plt
 import nibabel as nib
@@ -18,6 +19,11 @@ from synthmorph.dataset import SynthMorphDataset
 from synthmorph.loss import SynthMorphLoss
 from synthmorph.network import SynthMorphUNet
 from synthmorph.utils import create_integration_layer
+
+
+_GRID_CACHE: dict[
+    tuple[int, int, int, str, torch.dtype], tuple[torch.Tensor, torch.Tensor]
+] = {}
 
 
 def set_seed(seed: int) -> None:
@@ -38,8 +44,16 @@ def normalize_image(image: torch.Tensor) -> torch.Tensor:
     return (image - min_val) / denom
 
 
-def field_to_sampling_grid(vector_field: torch.Tensor) -> torch.Tensor:
-    batch_size, _, depth, height, width = vector_field.shape
+def _get_grid_components(
+    vector_field: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _, _, depth, height, width = vector_field.shape
+    key = (depth, height, width, str(vector_field.device), vector_field.dtype)
+
+    cached = _GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     z = torch.linspace(
         -1.0, 1.0, depth, device=vector_field.device, dtype=vector_field.dtype
     )
@@ -50,9 +64,7 @@ def field_to_sampling_grid(vector_field: torch.Tensor) -> torch.Tensor:
         -1.0, 1.0, width, device=vector_field.device, dtype=vector_field.dtype
     )
     zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
-    base_grid = (
-        torch.stack((xx, yy, zz), dim=-1).unsqueeze(0).repeat(batch_size, 1, 1, 1, 1)
-    )
+    base_grid = torch.stack((xx, yy, zz), dim=-1).unsqueeze(0)
 
     norm = torch.tensor(
         [
@@ -63,6 +75,15 @@ def field_to_sampling_grid(vector_field: torch.Tensor) -> torch.Tensor:
         device=vector_field.device,
         dtype=vector_field.dtype,
     ).view(1, 3, 1, 1, 1)
+
+    _GRID_CACHE[key] = (base_grid, norm)
+    return base_grid, norm
+
+
+def field_to_sampling_grid(vector_field: torch.Tensor) -> torch.Tensor:
+    batch_size = vector_field.shape[0]
+    base_grid_single, norm = _get_grid_components(vector_field)
+    base_grid = base_grid_single.expand(batch_size, -1, -1, -1, -1)
 
     normalized_field = vector_field * norm
     return base_grid + normalized_field.permute(0, 2, 3, 4, 1)
@@ -330,6 +351,14 @@ def main() -> None:
     set_seed(config.seed)
 
     device = torch.device(config.device)
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    amp_dtype_name = str(getattr(config, "amp_dtype", "bfloat16")).lower()
+    amp_dtype = torch.bfloat16 if amp_dtype_name == "bfloat16" else torch.float16
+    use_amp = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
+
     ensure_dir(config.output_dir)
 
     validated_patients = validate_validation_folder_structure()
@@ -349,6 +378,10 @@ def main() -> None:
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
+        prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
+        persistent_workers=(
+            config.persistent_workers if config.num_workers > 0 else False
+        ),
     )
 
     model = SynthMorphUNet().to(device)
@@ -392,19 +425,29 @@ def main() -> None:
             train_loader, desc=f"Train {epoch}/{config.num_epochs}", leave=False
         )
         for batch in batch_progress:
-            fixed_image = batch["fixed_image"].to(device).unsqueeze(1)
-            moving_image = batch["moving_image"].to(device).unsqueeze(1)
-            fixed_label = batch["fixed_label_map"].to(device)
-            moving_label = batch["moving_label_map"].to(device)
-
-            model_input = torch.cat([fixed_image, moving_image], dim=1)
-            vector_field = model(model_input)
-            integrated_field = integration_layer(vector_field)
-            warped_moving_label = warp_label_map(moving_label, integrated_field)
-
-            total_loss, _, _ = train_loss_fn(
-                fixed_label, warped_moving_label, vector_field
+            fixed_image = (
+                batch["fixed_image"].to(device, non_blocking=True).unsqueeze(1)
             )
+            moving_image = (
+                batch["moving_image"].to(device, non_blocking=True).unsqueeze(1)
+            )
+            fixed_label = batch["fixed_label_map"].to(device, non_blocking=True)
+            moving_label = batch["moving_label_map"].to(device, non_blocking=True)
+
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=amp_dtype)
+                if use_amp
+                else nullcontext()
+            )
+            with autocast_ctx:
+                model_input = torch.cat([fixed_image, moving_image], dim=1)
+                vector_field = model(model_input)
+                integrated_field = integration_layer(vector_field)
+                warped_moving_label = warp_label_map(moving_label, integrated_field)
+
+                total_loss, _, _ = train_loss_fn(
+                    fixed_label, warped_moving_label, vector_field
+                )
 
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()

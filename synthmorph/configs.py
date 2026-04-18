@@ -12,13 +12,17 @@ seed = 42
 # Runtime and optimization
 device = "cuda" if torch.cuda.is_available() else "cpu"
 batch_size = 1
-num_workers = 0
+num_workers = min(8, max(2, (os.cpu_count() or 4) - 1))
 pin_memory = device == "cuda"
+prefetch_factor = 2
+persistent_workers = num_workers > 0
 num_epochs = 150
 learning_rate = 1e-4
 optimizer_type = "AdamW"
 weight_decay = 1e-5
 regularization_weight = 1.0
+use_amp = device == "cuda"
+amp_dtype = "bfloat16"
 
 # Data and label settings
 image_size = (160, 192, 224)
@@ -47,6 +51,6 @@ dice_plot_filename = "dice_curve.png"
 generator_config = {
     "full_image_size": image_size,
     "num_classes": train_num_classes,
-    "device": device,
+    "device": "cpu",  # Generate on CPU; H100 trains on GPU data transferred per batch
     "integration_steps": integration_steps,
 }
