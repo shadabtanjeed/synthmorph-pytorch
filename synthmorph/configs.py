@@ -6,13 +6,16 @@ import os
 import torch
 
 
+is_windows = os.name == "nt"
+
+
 # Reproducibility
 seed = 42
 
 # Runtime and optimization
 device = "cuda" if torch.cuda.is_available() else "cpu"
 batch_size = 1
-num_workers = min(8, max(2, (os.cpu_count() or 4) - 1))
+num_workers = 0 if is_windows else min(8, max(2, (os.cpu_count() or 4) - 1))
 pin_memory = device == "cuda"
 prefetch_factor = 2
 persistent_workers = num_workers > 0

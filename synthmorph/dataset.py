@@ -14,7 +14,14 @@ class SynthMorphDataset(Dataset):
             config: Configuration dictionary for GenerateIntensityPair
         """
         self.size = size
-        self.intensity_generator = GenerateIntensityPair(config)
+        self.generator_config = dict(config) if config is not None else None
+        self.intensity_generator: GenerateIntensityPair | None = None
+
+    def _get_intensity_generator(self) -> GenerateIntensityPair:
+        # Lazily initialize in the worker process to avoid serializing heavy tensors.
+        if self.intensity_generator is None:
+            self.intensity_generator = GenerateIntensityPair(self.generator_config)
+        return self.intensity_generator
 
     def __len__(self) -> int:
         """Return the size of the dataset."""
@@ -38,21 +45,16 @@ class SynthMorphDataset(Dataset):
             - moving_label_map: Moving label map
         """
         # Generate the label map pair
-        fixed_label_map, moving_label_map = (
-            self.intensity_generator.createLabelMapPair()
-        )
+        intensity_generator = self._get_intensity_generator()
+        fixed_label_map, moving_label_map = intensity_generator.createLabelMapPair()
 
         # Generate the intensity pair from the label maps
-        fixed_intensity, moving_intensity = (
-            self.intensity_generator.createIntensityPair(
-                label_map_pair=(fixed_label_map, moving_label_map)
-            )
+        fixed_intensity, moving_intensity = intensity_generator.createIntensityPair(
+            label_map_pair=(fixed_label_map, moving_label_map)
         )
 
         # Normalize intensity images to [0, 1] using the max intensity from config
-        max_intensity = max(
-            float(self.intensity_generator.intensity_clip_range[1]), 1e-6
-        )
+        max_intensity = max(float(intensity_generator.intensity_clip_range[1]), 1e-6)
         fixed_intensity = fixed_intensity / max_intensity
         moving_intensity = moving_intensity / max_intensity
 
