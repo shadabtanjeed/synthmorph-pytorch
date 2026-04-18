@@ -30,7 +30,7 @@ early_stopping_patience = 15
 
 # Data and label settings
 image_size = (160, 192, 224)
-train_dataset_size = 50
+train_dataset_size = 100
 train_num_classes = 26
 val_num_classes = 35
 ignore_label = 0

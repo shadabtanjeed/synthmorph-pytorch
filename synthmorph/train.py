@@ -319,6 +319,43 @@ def evaluate_on_validation(
     return mean_val_loss, mean_val_dice
 
 
+def setup_logger(output_dir: str) -> str:
+    """Create and initialize a log file."""
+    ensure_dir(output_dir)
+    log_path = os.path.join(output_dir, "training_log.txt")
+    
+    # Write header if file is new
+    if not os.path.exists(log_path):
+        with open(log_path, "w") as f:
+            f.write("Epoch,Train_Loss,Train_Similarity_Loss,Train_Smooth_Loss,")
+            f.write("Val_Loss,Val_Dice\n")
+    
+    return log_path
+
+
+def log_epoch(
+    log_path: str,
+    epoch: int,
+    train_total_loss: float,
+    train_similarity_loss: float,
+    train_smooth_loss: float,
+    val_loss: float | None = None,
+    val_dice: float | None = None,
+) -> None:
+    """Append epoch results to the log file."""
+    with open(log_path, "a") as f:
+        f.write(f"{epoch},")
+        f.write(f"{train_total_loss:.6f},")
+        f.write(f"{train_similarity_loss:.6f},")
+        f.write(f"{train_smooth_loss:.6f},")
+        
+        if val_loss is not None and val_dice is not None:
+            f.write(f"{val_loss:.6f},")
+            f.write(f"{val_dice:.6f}\n")
+        else:
+            f.write("N/A,N/A\n")
+
+
 def save_curves(
     train_losses: list[float],
     val_losses: list[float],
@@ -374,6 +411,7 @@ def main() -> None:
     use_amp = bool(getattr(config, "use_amp", False)) and device.type == "cuda"
 
     ensure_dir(config.output_dir)
+    log_path = setup_logger(config.output_dir)
 
     validated_patients = validate_validation_folder_structure()
     if validated_patients:
@@ -436,6 +474,8 @@ def main() -> None:
     for epoch in epoch_progress:
         model.train()
         running_train_loss = 0.0
+        running_similarity_loss = 0.0
+        running_smooth_loss = 0.0
 
         batch_progress = tqdm(
             train_loader, desc=f"Train {epoch}/{config.num_epochs}", leave=False
@@ -467,7 +507,7 @@ def main() -> None:
                     num_classes=config.train_num_classes,
                 )
 
-                total_loss, _, _ = train_loss_fn(
+                total_loss, similarity_loss, smooth_loss = train_loss_fn(
                     fixed_label,
                     warped_moving_probs,
                     vector_field,
@@ -477,9 +517,13 @@ def main() -> None:
             optimizer.step()
 
             running_train_loss += float(total_loss.item())
+            running_similarity_loss += float(similarity_loss.item())
+            running_smooth_loss += float(smooth_loss.item())
             batch_progress.set_postfix(loss=f"{total_loss.item():.4f}")
 
         epoch_train_loss = running_train_loss / len(train_loader)
+        epoch_similarity_loss = running_similarity_loss / len(train_loader)
+        epoch_smooth_loss = running_smooth_loss / len(train_loader)
         train_losses.append(epoch_train_loss)
 
         log_suffix = f"train_loss={epoch_train_loss:.4f}"
@@ -511,6 +555,16 @@ def main() -> None:
                 f"[Val] epoch={epoch} val_loss={val_loss:.6f} val_dice={val_dice:.6f}"
             )
 
+            log_epoch(
+                log_path,
+                epoch,
+                epoch_train_loss,
+                epoch_similarity_loss,
+                epoch_smooth_loss,
+                val_loss,
+                val_dice,
+            )
+
             if not math.isnan(val_loss) and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 if os.path.exists(best_model_path):
@@ -527,6 +581,14 @@ def main() -> None:
 
             save_curves(train_losses, val_losses, val_dices, val_epochs)
             log_suffix += f", val_loss={val_loss:.4f}, val_dice={val_dice:.4f}"
+        else:
+            log_epoch(
+                log_path,
+                epoch,
+                epoch_train_loss,
+                epoch_similarity_loss,
+                epoch_smooth_loss,
+            )
 
         epoch_progress.set_postfix_str(log_suffix)
 
