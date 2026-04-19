@@ -12,6 +12,7 @@ import nibabel as nib
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam, AdamW
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -229,6 +230,7 @@ def forward_patch_based(
     model_input = torch.cat([fixed_image, moving_image], dim=1)  # [B, 2, D, H, W]
     batch_size = model_input.shape[0]
     full_fields: list[torch.Tensor] = []
+    use_activation_checkpointing = torch.is_grad_enabled()
 
     for batch_index in range(batch_size):
         sample_input = model_input[batch_index]  # [2, D, H, W]
@@ -237,7 +239,11 @@ def forward_patch_based(
         vector_field_patches: list[torch.Tensor] = []
         for patch in patches:
             patch_batch = patch.unsqueeze(0)  # [1, 2, P, P, P]
-            patch_field = model(patch_batch)  # [1, 3, P, P, P]
+            if use_activation_checkpointing:
+                # Checkpoint each patch forward to avoid storing large intermediate activations.
+                patch_field = checkpoint(model, patch_batch, use_reentrant=False)
+            else:
+                patch_field = model(patch_batch)  # [1, 3, P, P, P]
             vector_field_patches.append(patch_field.squeeze(0))  # [3, P, P, P]
 
         full_vector_field = patch_processor.stitch_patches(
@@ -669,6 +675,15 @@ def main() -> None:
     flow_scale = float(getattr(config, "flow_scale", 1.0))
     dice_chunk_size = int(getattr(config, "dice_chunk_size", 4))
     dice_epsilon = float(getattr(config, "dice_epsilon", 1e-5))
+    use_patch_based = bool(getattr(config, "use_patch_based", False))
+
+    effective_batch_size = int(config.batch_size)
+    if use_patch_based and effective_batch_size != 1:
+        print(
+            "[PatchMode] Overriding batch_size from "
+            f"{effective_batch_size} to 1 to prevent patch-graph OOM."
+        )
+        effective_batch_size = 1
 
     run_output_dir = resolve_run_output_dir(config.output_dir)
     ensure_dir(run_output_dir)
@@ -687,7 +702,7 @@ def main() -> None:
     )
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.batch_size,
+        batch_size=effective_batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
@@ -703,7 +718,6 @@ def main() -> None:
         integration_steps=config.integration_steps,
     ).to(device)
 
-    use_patch_based = bool(getattr(config, "use_patch_based", False))
     patch_processor = None
     if use_patch_based:
         patch_size = int(getattr(config, "patch_size", 64))
