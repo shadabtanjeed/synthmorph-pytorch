@@ -130,6 +130,18 @@ def soft_dice_loss_from_warped_labels_chunked(
     fixed_label_map = torch.clamp(fixed_label_map.long(), 0, num_classes - 1)
     moving_label_map = torch.clamp(moving_label_map.long(), 0, num_classes - 1)
 
+    if fixed_label_map.shape[0] != moving_label_map.shape[0]:
+        raise ValueError(
+            "Batch size mismatch between fixed and moving labels: "
+            f"{fixed_label_map.shape[0]} vs {moving_label_map.shape[0]}"
+        )
+    if integrated_field.shape[0] != fixed_label_map.shape[0]:
+        raise ValueError(
+            "Batch size mismatch between labels and deformation field: "
+            f"labels batch={fixed_label_map.shape[0]}, field batch={integrated_field.shape[0]}. "
+            "If using patch-based forward, ensure it returns one field per input sample."
+        )
+
     valid_classes = [
         class_index for class_index in range(num_classes) if class_index != ignore_label
     ]
@@ -205,29 +217,38 @@ def forward_patch_based(
 ) -> torch.Tensor:
     """
     Forward pass on overlapping patches.
-    Inputs: fixed_image [1, 1, D, H, W], moving_image [1, 1, D, H, W]
-    Output: vector_field [1, 3, D, H, W]
+    Inputs: fixed_image [B, 1, D, H, W], moving_image [B, 1, D, H, W]
+    Output: vector_field [B, 3, D, H, W]
     """
-    model_input = torch.cat([fixed_image, moving_image], dim=1)  # [1, 2, D, H, W]
+    if fixed_image.shape[0] != moving_image.shape[0]:
+        raise ValueError(
+            "Batch size mismatch between fixed and moving images: "
+            f"{fixed_image.shape[0]} vs {moving_image.shape[0]}"
+        )
 
-    patches, positions = patch_processor.extract_patches(
-        model_input[0]
-    )  # Remove batch dim
+    model_input = torch.cat([fixed_image, moving_image], dim=1)  # [B, 2, D, H, W]
+    batch_size = model_input.shape[0]
+    full_fields: list[torch.Tensor] = []
 
-    vector_field_patches = []
-    for patch in patches:
-        patch_batch = patch.unsqueeze(0)  # Add batch dim back
-        with torch.set_grad_enabled(patch_batch.requires_grad):
+    for batch_index in range(batch_size):
+        sample_input = model_input[batch_index]  # [2, D, H, W]
+        patches, positions = patch_processor.extract_patches(sample_input)
+
+        vector_field_patches: list[torch.Tensor] = []
+        for patch in patches:
+            patch_batch = patch.unsqueeze(0)  # [1, 2, P, P, P]
             patch_field = model(patch_batch)  # [1, 3, P, P, P]
-        vector_field_patches.append(patch_field[0])  # Remove batch dim
+            vector_field_patches.append(patch_field.squeeze(0))  # [3, P, P, P]
 
-    full_vector_field = patch_processor.stitch_patches(
-        vector_field_patches,
-        positions,
-        device=device,
-        dtype=model_input.dtype,
-    )
-    return full_vector_field
+        full_vector_field = patch_processor.stitch_patches(
+            vector_field_patches,
+            positions,
+            device=device,
+            dtype=model_input.dtype,
+        )
+        full_fields.append(full_vector_field.squeeze(0))  # [3, D, H, W]
+
+    return torch.stack(full_fields, dim=0)  # [B, 3, D, H, W]
 
 
 def resolve_run_output_dir(base_output_dir: str) -> str:
