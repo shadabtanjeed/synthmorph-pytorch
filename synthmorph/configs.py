@@ -52,9 +52,14 @@ flow_scale = 10.0
 dice_chunk_size = 4
 dice_epsilon = 1e-5
 
+# Patch-based processing settings
+use_patch_based = True
+patch_size = 64
+patch_overlap = 16  # Overlap for stitching (default 1/4 of patch size)
+
 # Validation schedule and data
 validate_every = 5
-val_data_dir = "/kaggle/neurite-oasis-split/val"
+val_data_dir = "/home/ndag/synthmorph/neurite-oasis-split/val"
 val_image_filename = "aligned_norm.nii.gz"
 val_label_filename = "aligned_seg35.nii.gz"
 

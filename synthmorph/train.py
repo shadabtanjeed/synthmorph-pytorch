@@ -19,7 +19,7 @@ from synthmorph import configs as config
 from synthmorph.dataset import SynthMorphDataset
 from synthmorph.loss import diffusion_loss
 from synthmorph.network import SynthMorphUNet
-from synthmorph.utils import create_integration_layer
+from synthmorph.utils import create_integration_layer, PatchProcessor
 
 
 _GRID_CACHE: dict[
@@ -194,6 +194,40 @@ def warp_intensity_map(
         align_corners=True,
     )
     return warped.squeeze(1)
+
+
+def forward_patch_based(
+    model: SynthMorphUNet,
+    fixed_image: torch.Tensor,
+    moving_image: torch.Tensor,
+    patch_processor: PatchProcessor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Forward pass on overlapping patches.
+    Inputs: fixed_image [1, 1, D, H, W], moving_image [1, 1, D, H, W]
+    Output: vector_field [1, 3, D, H, W]
+    """
+    model_input = torch.cat([fixed_image, moving_image], dim=1)  # [1, 2, D, H, W]
+
+    patches, positions = patch_processor.extract_patches(
+        model_input[0]
+    )  # Remove batch dim
+
+    vector_field_patches = []
+    for patch in patches:
+        patch_batch = patch.unsqueeze(0)  # Add batch dim back
+        with torch.set_grad_enabled(patch_batch.requires_grad):
+            patch_field = model(patch_batch)  # [1, 3, P, P, P]
+        vector_field_patches.append(patch_field[0])  # Remove batch dim
+
+    full_vector_field = patch_processor.stitch_patches(
+        vector_field_patches,
+        positions,
+        device=device,
+        dtype=model_input.dtype,
+    )
+    return full_vector_field
 
 
 def resolve_run_output_dir(base_output_dir: str) -> str:
@@ -387,6 +421,7 @@ def evaluate_on_validation(
     device: torch.device,
     epoch: int,
     output_dir: str,
+    patch_processor: PatchProcessor | None = None,
 ) -> tuple[float, float]:
     patients = discover_validation_patients()
     pairs = build_validation_pairs(patients)
@@ -433,7 +468,18 @@ def evaluate_on_validation(
             )
 
             model_input = torch.stack([fixed_image, moving_image], dim=0).unsqueeze(0)
-            vector_field = model(model_input)
+            if patch_processor is not None:
+                fixed_img_batch = fixed_image.unsqueeze(0)
+                moving_img_batch = moving_image.unsqueeze(0)
+                vector_field = forward_patch_based(
+                    model,
+                    fixed_img_batch,
+                    moving_img_batch,
+                    patch_processor,
+                    device,
+                )
+            else:
+                vector_field = model(model_input)
             effective_vector_field = vector_field * flow_scale
             integrated_field = integration_layer(effective_vector_field)
 
@@ -636,6 +682,17 @@ def main() -> None:
         integration_steps=config.integration_steps,
     ).to(device)
 
+    use_patch_based = bool(getattr(config, "use_patch_based", False))
+    patch_processor = None
+    if use_patch_based:
+        patch_size = int(getattr(config, "patch_size", 64))
+        patch_overlap = int(getattr(config, "patch_overlap", 16))
+        patch_processor = PatchProcessor(
+            full_size=config.image_size,
+            patch_size=patch_size,
+            overlap=patch_overlap,
+        )
+
     optimizer = get_optimizer(
         model.parameters(),
         optimizer_name=config.optimizer_type,
@@ -681,8 +738,17 @@ def main() -> None:
                 else nullcontext()
             )
             with autocast_ctx:
-                model_input = torch.cat([fixed_image, moving_image], dim=1)
-                vector_field = model(model_input)
+                if use_patch_based and patch_processor is not None:
+                    vector_field = forward_patch_based(
+                        model,
+                        fixed_image,
+                        moving_image,
+                        patch_processor,
+                        device,
+                    )
+                else:
+                    model_input = torch.cat([fixed_image, moving_image], dim=1)
+                    vector_field = model(model_input)
                 effective_vector_field = vector_field * flow_scale
                 integrated_field = integration_layer(effective_vector_field)
                 similarity_loss = soft_dice_loss_from_warped_labels_chunked(
@@ -793,6 +859,7 @@ def main() -> None:
                 device,
                 epoch,
                 run_output_dir,
+                patch_processor,
             )
             val_losses.append(val_loss)
             val_dices.append(val_dice)
