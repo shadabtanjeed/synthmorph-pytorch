@@ -31,7 +31,7 @@ early_stopping_metric = "val"
 early_stopping_min_delta = 1e-3
 
 # Optional debug tracing
-debug_training = True
+debug_training = False
 debug_every_n_epochs = 5
 debug_batches_per_epoch = 4
 
@@ -43,10 +43,14 @@ val_num_classes = 35
 ignore_label = 0
 
 # Integration / deformation settings
-integration_steps = 7
+integration_steps = 5
 # Optional multiplier applied to the predicted velocity field before integration.
 # Use 1.0 for baseline behavior, or try 10.0 as a jumpstart if deformations stay tiny.
 flow_scale = 10.0
+
+# Memory-aware soft Dice settings
+dice_chunk_size = 4
+dice_epsilon = 1e-5
 
 # Validation schedule and data
 validate_every = 5

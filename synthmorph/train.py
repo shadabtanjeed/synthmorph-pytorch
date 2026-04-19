@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from synthmorph import configs as config
 from synthmorph.dataset import SynthMorphDataset
-from synthmorph.loss import SynthMorphLoss
+from synthmorph.loss import diffusion_loss
 from synthmorph.network import SynthMorphUNet
 from synthmorph.utils import create_integration_layer
 
@@ -111,6 +111,68 @@ def warp_label_map_soft(
         align_corners=True,
     )
     return warped_probs
+
+
+def soft_dice_loss_from_warped_labels_chunked(
+    fixed_label_map: torch.Tensor,
+    moving_label_map: torch.Tensor,
+    integrated_field: torch.Tensor,
+    num_classes: int,
+    ignore_label: int,
+    chunk_size: int,
+    epsilon: float,
+) -> torch.Tensor:
+    if fixed_label_map.dim() == 3:
+        fixed_label_map = fixed_label_map.unsqueeze(0)
+    if moving_label_map.dim() == 3:
+        moving_label_map = moving_label_map.unsqueeze(0)
+
+    fixed_label_map = torch.clamp(fixed_label_map.long(), 0, num_classes - 1)
+    moving_label_map = torch.clamp(moving_label_map.long(), 0, num_classes - 1)
+
+    valid_classes = [
+        class_index for class_index in range(num_classes) if class_index != ignore_label
+    ]
+    if not valid_classes:
+        return integrated_field.new_tensor(0.0)
+
+    sampling_grid = field_to_sampling_grid(integrated_field)
+    dice_sum = integrated_field.new_tensor(0.0)
+    class_count = 0
+
+    fixed_expanded = fixed_label_map.unsqueeze(1)
+    moving_expanded = moving_label_map.unsqueeze(1)
+
+    for start in range(0, len(valid_classes), max(1, chunk_size)):
+        class_chunk = valid_classes[start : start + max(1, chunk_size)]
+        classes = torch.tensor(
+            class_chunk,
+            device=integrated_field.device,
+            dtype=torch.long,
+        ).view(1, -1, 1, 1, 1)
+
+        moving_chunk = (moving_expanded == classes).to(dtype=integrated_field.dtype)
+        warped_chunk = F.grid_sample(
+            moving_chunk,
+            sampling_grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        fixed_chunk = (fixed_expanded == classes).to(dtype=integrated_field.dtype)
+
+        intersection = (fixed_chunk * warped_chunk).sum(dim=(0, 2, 3, 4))
+        fixed_volume = fixed_chunk.sum(dim=(0, 2, 3, 4))
+        moving_volume = warped_chunk.sum(dim=(0, 2, 3, 4))
+
+        dice_chunk = (2.0 * intersection + epsilon) / (
+            fixed_volume + moving_volume + epsilon
+        )
+        dice_sum = dice_sum + dice_chunk.sum()
+        class_count += len(class_chunk)
+
+    mean_dice = dice_sum / max(class_count, 1)
+    return 1.0 - mean_dice
 
 
 def warp_intensity_map(
@@ -322,7 +384,6 @@ def build_validation_pairs(patients: list[Path]) -> list[tuple[Path, Path]]:
 def evaluate_on_validation(
     model: SynthMorphUNet,
     integration_layer,
-    val_loss_fn: SynthMorphLoss,
     device: torch.device,
     epoch: int,
     output_dir: str,
@@ -337,6 +398,8 @@ def evaluate_on_validation(
     total_val_loss = 0.0
     total_val_dice = 0.0
     flow_scale = float(getattr(config, "flow_scale", 1.0))
+    dice_chunk_size = int(getattr(config, "dice_chunk_size", 4))
+    dice_epsilon = float(getattr(config, "dice_epsilon", 1e-5))
     num_vis_pairs = min(5, len(pairs))
     vis_pair_indices = set(random.sample(range(len(pairs)), num_vis_pairs))
     vis_samples: list[dict] = []
@@ -373,23 +436,20 @@ def evaluate_on_validation(
             vector_field = model(model_input)
             effective_vector_field = vector_field * flow_scale
             integrated_field = integration_layer(effective_vector_field)
-            warped_moving_probs = warp_label_map_soft(
+
+            val_similarity_loss = soft_dice_loss_from_warped_labels_chunked(
+                fixed_label.unsqueeze(0),
                 moving_label.unsqueeze(0),
                 integrated_field,
                 num_classes=config.val_num_classes,
+                ignore_label=config.ignore_label,
+                chunk_size=dice_chunk_size,
+                epsilon=dice_epsilon,
             )
-
-            # Clamp labels to valid range for loss computation
-            fixed_label_clamped = torch.clamp(
-                fixed_label.unsqueeze(0),
-                0,
-                config.val_num_classes - 1,
-            )
-
-            val_total_loss, val_similarity_loss, _ = val_loss_fn(
-                fixed_label_clamped,
-                warped_moving_probs,
-                effective_vector_field,
+            val_smooth_loss = diffusion_loss(effective_vector_field)
+            val_total_loss = (
+                val_similarity_loss
+                + float(config.regularization_weight) * val_smooth_loss
             )
             val_dice = 1.0 - val_similarity_loss
 
@@ -438,13 +498,13 @@ def setup_logger(output_dir: str) -> str:
     """Create and initialize a log file."""
     ensure_dir(output_dir)
     log_path = os.path.join(output_dir, "training_log.txt")
-    
+
     # Write header if file is new
     if not os.path.exists(log_path):
         with open(log_path, "w") as f:
             f.write("Epoch,Train_Loss,Train_Similarity_Loss,Train_Smooth_Loss,")
             f.write("Val_Loss,Val_Dice\n")
-    
+
     return log_path
 
 
@@ -463,7 +523,7 @@ def log_epoch(
         f.write(f"{train_total_loss:.6f},")
         f.write(f"{train_similarity_loss:.6f},")
         f.write(f"{train_smooth_loss:.8e},")
-        
+
         if val_loss is not None and val_dice is not None:
             f.write(f"{val_loss:.6f},")
             f.write(f"{val_dice:.6f}\n")
@@ -540,6 +600,8 @@ def main() -> None:
     early_stopping_metric = str(getattr(config, "early_stopping_metric", "val")).lower()
     early_stopping_min_delta = float(getattr(config, "early_stopping_min_delta", 0.0))
     flow_scale = float(getattr(config, "flow_scale", 1.0))
+    dice_chunk_size = int(getattr(config, "dice_chunk_size", 4))
+    dice_epsilon = float(getattr(config, "dice_epsilon", 1e-5))
 
     run_output_dir = resolve_run_output_dir(config.output_dir)
     ensure_dir(run_output_dir)
@@ -573,17 +635,6 @@ def main() -> None:
         image_size=config.image_size,
         integration_steps=config.integration_steps,
     ).to(device)
-
-    train_loss_fn = SynthMorphLoss(
-        num_classes=config.train_num_classes,
-        ignore_label=config.ignore_label,
-        lambda_smooth=config.regularization_weight,
-    )
-    val_loss_fn = SynthMorphLoss(
-        num_classes=config.val_num_classes,
-        ignore_label=config.ignore_label,
-        lambda_smooth=config.regularization_weight,
-    )
 
     optimizer = get_optimizer(
         model.parameters(),
@@ -634,16 +685,18 @@ def main() -> None:
                 vector_field = model(model_input)
                 effective_vector_field = vector_field * flow_scale
                 integrated_field = integration_layer(effective_vector_field)
-                warped_moving_probs = warp_label_map_soft(
+                similarity_loss = soft_dice_loss_from_warped_labels_chunked(
+                    fixed_label,
                     moving_label,
                     integrated_field,
                     num_classes=config.train_num_classes,
+                    ignore_label=config.ignore_label,
+                    chunk_size=dice_chunk_size,
+                    epsilon=dice_epsilon,
                 )
-
-                total_loss, similarity_loss, smooth_loss = train_loss_fn(
-                    fixed_label,
-                    warped_moving_probs,
-                    effective_vector_field,
+                smooth_loss = diffusion_loss(effective_vector_field)
+                total_loss = (
+                    similarity_loss + float(config.regularization_weight) * smooth_loss
                 )
 
             total_loss.backward()
@@ -656,14 +709,14 @@ def main() -> None:
             if should_debug_batch:
                 with torch.no_grad():
                     identity_field = torch.zeros_like(integrated_field)
-                    identity_probs = warp_label_map_soft(
+                    identity_similarity = soft_dice_loss_from_warped_labels_chunked(
+                        fixed_label,
                         moving_label,
                         identity_field,
                         num_classes=config.train_num_classes,
-                    )
-                    identity_similarity = train_loss_fn.dice_loss(
-                        fixed_label,
-                        identity_probs,
+                        ignore_label=config.ignore_label,
+                        chunk_size=dice_chunk_size,
+                        epsilon=dice_epsilon,
                     )
                     identity_dice = float((1.0 - identity_similarity).item())
                     warped_dice = float((1.0 - similarity_loss.detach()).item())
@@ -737,7 +790,6 @@ def main() -> None:
             val_loss, val_dice = evaluate_on_validation(
                 model,
                 integration_layer,
-                val_loss_fn,
                 device,
                 epoch,
                 run_output_dir,
