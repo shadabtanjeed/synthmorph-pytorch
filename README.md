@@ -25,14 +25,6 @@ Expected validation folder structure:
     - aligned_norm.nii.gz
     - aligned_seg35.nii.gz
 
-Training pipeline:
-
-- Trains on synthetic data generated on the fly.
-- Runs validation every 10 epochs on randomly paired real patients.
-- Uses 26 labels for training and 35 labels for validation (label 0 ignored).
-- Saves best model based on validation loss.
-- Updates loss/dice plots at each validation step.
-
 Run instructions:
 
 1. Install dependencies:
