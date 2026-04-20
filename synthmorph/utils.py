@@ -88,6 +88,18 @@ class PatchProcessor:
         Extract overlapping patches from a volume.
         Returns list of patches and list of their (d_start, h_start, w_start) positions.
         """
+        if volume.dim() != 4:
+            raise ValueError(
+                "PatchProcessor.extract_patches expects [C, D, H, W], "
+                f"got shape {tuple(volume.shape)}"
+            )
+
+        if tuple(volume.shape[1:]) != self.full_size:
+            raise ValueError(
+                "PatchProcessor.extract_patches got unexpected spatial size: "
+                f"{tuple(volume.shape[1:])}, expected {self.full_size}"
+            )
+
         d, h, w = self.full_size
         patches = []
         positions = []

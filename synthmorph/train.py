@@ -221,10 +221,33 @@ def forward_patch_based(
     Inputs: fixed_image [B, 1, D, H, W], moving_image [B, 1, D, H, W]
     Output: vector_field [B, 3, D, H, W]
     """
+    if fixed_image.dim() == 4:
+        fixed_image = fixed_image.unsqueeze(1)
+    if moving_image.dim() == 4:
+        moving_image = moving_image.unsqueeze(1)
+
+    if fixed_image.dim() != 5 or moving_image.dim() != 5:
+        raise ValueError(
+            "forward_patch_based expects [B, 1, D, H, W] (or [B, D, H, W]); "
+            f"got fixed={tuple(fixed_image.shape)} moving={tuple(moving_image.shape)}"
+        )
+
     if fixed_image.shape[0] != moving_image.shape[0]:
         raise ValueError(
             "Batch size mismatch between fixed and moving images: "
             f"{fixed_image.shape[0]} vs {moving_image.shape[0]}"
+        )
+
+    if fixed_image.shape[2:] != moving_image.shape[2:]:
+        raise ValueError(
+            "Spatial size mismatch between fixed and moving images: "
+            f"{tuple(fixed_image.shape[2:])} vs {tuple(moving_image.shape[2:])}"
+        )
+
+    if fixed_image.shape[1] != 1 or moving_image.shape[1] != 1:
+        raise ValueError(
+            "forward_patch_based expects single-channel images; "
+            f"got fixed C={fixed_image.shape[1]}, moving C={moving_image.shape[1]}"
         )
 
     model_input = torch.cat([fixed_image, moving_image], dim=1)  # [B, 2, D, H, W]
@@ -496,8 +519,8 @@ def evaluate_on_validation(
 
             model_input = torch.stack([fixed_image, moving_image], dim=0).unsqueeze(0)
             if patch_processor is not None:
-                fixed_img_batch = fixed_image.unsqueeze(0)
-                moving_img_batch = moving_image.unsqueeze(0)
+                fixed_img_batch = fixed_image.unsqueeze(0).unsqueeze(0)
+                moving_img_batch = moving_image.unsqueeze(0).unsqueeze(0)
                 vector_field = forward_patch_based(
                     model,
                     fixed_img_batch,
