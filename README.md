@@ -32,3 +32,9 @@ Run instructions:
 2. Set the validation path in synthmorph/configs.py.
 3. Start training from repository root:
    python -m synthmorph.train
+
+Optional: override config values from CLI (omitted args keep defaults from configs.py):
+
+```
+python -m synthmorph.train --val-data-dir /path/to/val --batch-size 2 --num-epochs 100
+```

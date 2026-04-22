@@ -247,14 +247,14 @@ def validate_validation_folder_structure() -> list[Path]:
     if not config.val_data_dir:
         raise ValueError(
             "Validation is enabled, but config.val_data_dir is empty. "
-            "Set a valid validation folder path in synthmorph/configs.py."
+            "Set --val-data-dir or update synthmorph/configs.py."
         )
 
     val_root = Path(config.val_data_dir)
     if not val_root.exists():
         raise FileNotFoundError(
             f"Validation folder not found: {val_root}. "
-            "Check config.val_data_dir in synthmorph/configs.py."
+            "Check --val-data-dir or config.val_data_dir in synthmorph/configs.py."
         )
 
     if not val_root.is_dir():
@@ -438,13 +438,13 @@ def setup_logger(output_dir: str) -> str:
     """Create and initialize a log file."""
     ensure_dir(output_dir)
     log_path = os.path.join(output_dir, "training_log.txt")
-    
+
     # Write header if file is new
     if not os.path.exists(log_path):
         with open(log_path, "w") as f:
             f.write("Epoch,Train_Loss,Train_Similarity_Loss,Train_Smooth_Loss,")
             f.write("Val_Loss,Val_Dice\n")
-    
+
     return log_path
 
 
@@ -463,7 +463,7 @@ def log_epoch(
         f.write(f"{train_total_loss:.6f},")
         f.write(f"{train_similarity_loss:.6f},")
         f.write(f"{train_smooth_loss:.8e},")
-        
+
         if val_loss is not None and val_dice is not None:
             f.write(f"{val_loss:.6f},")
             f.write(f"{val_dice:.6f}\n")
@@ -522,6 +522,7 @@ def save_curves(
 
 
 def main() -> None:
+    config.configure_from_cli()
     set_seed(config.seed)
 
     device = torch.device(config.device)
