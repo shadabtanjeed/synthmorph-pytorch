@@ -14,6 +14,7 @@ Update synthmorph/configs.py to configure:
 - val_data_dir (path to validation patients)
 - train/validation hyperparameters
 - output paths and filenames
+- checkpoint options (checkpoint_filename, checkpoint_every, resume_checkpoint_path)
 
 Expected validation folder structure:
 
@@ -32,3 +33,14 @@ Run instructions:
 2. Set the validation path in synthmorph/configs.py.
 3. Start training from repository root:
    python -m synthmorph.train
+
+Resume after interruption:
+
+1. Locate the latest checkpoint in your run folder, for example:
+   outputs/<run_timestamp>/latest_checkpoint.pt
+2. Set resume_checkpoint_path in synthmorph/configs.py to that checkpoint path.
+3. Run again:
+   python -m synthmorph.train
+
+When resume_checkpoint_path is set, training continues from the next epoch and reuses
+the same run output folder.

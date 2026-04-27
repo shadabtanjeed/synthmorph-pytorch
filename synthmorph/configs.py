@@ -66,6 +66,9 @@ val_label_filename = "aligned_seg35.nii.gz"
 # Artifact output
 output_dir = os.path.join("outputs", "train")
 best_model_filename = "best_model.pt"
+checkpoint_filename = "latest_checkpoint.pt"
+checkpoint_every = 1
+resume_checkpoint_path = ""
 loss_plot_filename = "loss_curve.png"
 dice_plot_filename = "dice_curve.png"
 

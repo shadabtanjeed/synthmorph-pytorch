@@ -677,6 +677,68 @@ def save_curves(
     plt.close()
 
 
+def save_training_checkpoint(
+    checkpoint_path: str,
+    epoch: int,
+    model: SynthMorphUNet,
+    optimizer,
+    train_losses: list[float],
+    val_losses: list[float],
+    val_dices: list[float],
+    val_epochs: list[int],
+    best_val_loss: float,
+    best_early_stop_metric: float,
+    epochs_without_improvement: int,
+    run_output_dir: str,
+) -> None:
+    checkpoint_payload = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_dices": val_dices,
+        "val_epochs": val_epochs,
+        "best_val_loss": best_val_loss,
+        "best_early_stop_metric": best_early_stop_metric,
+        "epochs_without_improvement": epochs_without_improvement,
+        "run_output_dir": run_output_dir,
+        "python_rng_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+    }
+
+    if torch.cuda.is_available():
+        checkpoint_payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+
+    torch.save(checkpoint_payload, checkpoint_path)
+
+
+def load_training_checkpoint(
+    checkpoint_path: str,
+    model: SynthMorphUNet,
+    optimizer,
+    device: torch.device,
+) -> dict:
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    python_rng_state = checkpoint.get("python_rng_state")
+    if python_rng_state is not None:
+        random.setstate(python_rng_state)
+
+    torch_rng_state = checkpoint.get("torch_rng_state")
+    if torch_rng_state is not None:
+        torch.set_rng_state(torch_rng_state)
+
+    cuda_rng_state_all = checkpoint.get("cuda_rng_state_all")
+    if cuda_rng_state_all is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_rng_state_all)
+
+    return checkpoint
+
+
 def main() -> None:
     set_seed(config.seed)
 
@@ -699,6 +761,16 @@ def main() -> None:
     dice_chunk_size = int(getattr(config, "dice_chunk_size", 4))
     dice_epsilon = float(getattr(config, "dice_epsilon", 1e-5))
     use_patch_based = bool(getattr(config, "use_patch_based", False))
+    checkpoint_filename = str(
+        getattr(config, "checkpoint_filename", "latest_checkpoint.pt")
+    )
+    checkpoint_every = max(1, int(getattr(config, "checkpoint_every", 1)))
+    resume_checkpoint_path = str(getattr(config, "resume_checkpoint_path", "")).strip()
+
+    if resume_checkpoint_path and not os.path.exists(resume_checkpoint_path):
+        raise FileNotFoundError(
+            f"resume_checkpoint_path does not exist: {resume_checkpoint_path}"
+        )
 
     effective_batch_size = int(config.batch_size)
     if use_patch_based and effective_batch_size != 1:
@@ -708,9 +780,14 @@ def main() -> None:
         )
         effective_batch_size = 1
 
-    run_output_dir = resolve_run_output_dir(config.output_dir)
+    if resume_checkpoint_path:
+        resume_run_dir = str(Path(resume_checkpoint_path).resolve().parent)
+        run_output_dir = resume_run_dir
+    else:
+        run_output_dir = resolve_run_output_dir(config.output_dir)
     ensure_dir(run_output_dir)
     log_path = setup_logger(run_output_dir)
+    checkpoint_path = os.path.join(run_output_dir, checkpoint_filename)
 
     validated_patients = validate_validation_folder_structure()
     if validated_patients:
@@ -766,9 +843,50 @@ def main() -> None:
     best_val_loss = float("inf")
     best_early_stop_metric = float("inf")
     epochs_without_improvement = 0
+    start_epoch = 1
     best_model_path = os.path.join(run_output_dir, config.best_model_filename)
 
-    epoch_progress = tqdm(range(1, config.num_epochs + 1), desc="Epochs")
+    if resume_checkpoint_path:
+        checkpoint = load_training_checkpoint(
+            resume_checkpoint_path,
+            model,
+            optimizer,
+            device,
+        )
+
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        train_losses = list(checkpoint.get("train_losses", []))
+        val_losses = list(checkpoint.get("val_losses", []))
+        val_dices = list(checkpoint.get("val_dices", []))
+        val_epochs = list(checkpoint.get("val_epochs", []))
+        best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+        best_early_stop_metric = float(
+            checkpoint.get("best_early_stop_metric", float("inf"))
+        )
+        epochs_without_improvement = int(
+            checkpoint.get("epochs_without_improvement", 0)
+        )
+
+        saved_output_dir = str(checkpoint.get("run_output_dir", run_output_dir))
+        if os.path.normpath(saved_output_dir) != os.path.normpath(run_output_dir):
+            print(
+                "[Resume] Checkpoint run_output_dir differs from checkpoint location. "
+                f"Using: {run_output_dir}"
+            )
+
+        print(
+            f"[Resume] Loaded checkpoint from {resume_checkpoint_path} "
+            f"(epoch={start_epoch - 1})."
+        )
+
+    if start_epoch > int(config.num_epochs):
+        print(
+            "Checkpoint epoch is already at or beyond num_epochs. " "Nothing to train."
+        )
+        print(f"Run outputs: {run_output_dir}")
+        return
+
+    epoch_progress = tqdm(range(start_epoch, config.num_epochs + 1), desc="Epochs")
     for epoch in epoch_progress:
         model.train()
         running_train_loss = 0.0
@@ -972,6 +1090,22 @@ def main() -> None:
             run_output_dir,
             epoch,
         )
+
+        if epoch % checkpoint_every == 0:
+            save_training_checkpoint(
+                checkpoint_path=checkpoint_path,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                train_losses=train_losses,
+                val_losses=val_losses,
+                val_dices=val_dices,
+                val_epochs=val_epochs,
+                best_val_loss=best_val_loss,
+                best_early_stop_metric=best_early_stop_metric,
+                epochs_without_improvement=epochs_without_improvement,
+                run_output_dir=run_output_dir,
+            )
 
         monitor_name = ""
         monitor_value: float | None = None
